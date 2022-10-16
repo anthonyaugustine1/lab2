@@ -1,0 +1,162 @@
+1)  boot_alloc : update nextfree with PGSIZE aligned nextfree+n. checks for n == 0 or if no pages left
+if (n == 0) 
+{
+	return nextfree;
+} 
+result = nextfree;
+nextfree = ROUNDUP(nextfree + n, PGSIZE);
+if ((uint32_t)nextfree > KERNBASE + npages * PGSIZE) 
+{
+	panic("Out of memory.\n");
+} 
+return result;
+
+2) mem_init : 
+//follow the prompt directions, create an struct pageinfo array of npages then use memset to initialize. 
+pages = (struct PageInfo*)boot_alloc(npages * sizeof(struct PageInfo));
+memset(pages, 0, npages * sizeof(struct PageInfo));
+
+//had to get help for using boot_map_region since it wasnt defined yet/no contextual clues, parameters were still mostly outlined in prompt
+boot_map_region(kern_pgdir, UPAGES, npages * sizeof(struct PageInfo), PADDR(pages), PTE_U | PTE_P);
+boot_map_region(kern_pgdir, KSTACKTOP - KSTKSIZE, KSTKSIZE, PADDR(bootstack), PTE_W);
+boot_map_region(kern_pgdir, KERNBASE, 0xffffffff - KERNBASE, 0, PTE_W);
+
+3) page_init : use the for loop to assign page_ref/link. step 1 and 2 are quite easy. 3&4 given a bounds based on a diagram, not sure if its right
+size_t i;
+
+//1
+pages[0].pp_ref = 1;
+pages[0].pp_link = NULL;
+for (i = 1; i < npages; i++) 
+{
+	if (i >= IOPHYSMEM / PGSIZE && i < EXTPHYSMEM / PGSIZE) 
+	{
+		//3
+		pages[i].pp_ref = 1;
+		pages[i].pp_link = NULL;
+	} else if (i >= EXTPHYSMEM / PGSIZE && i < ((uint32_t)boot_alloc(0) - KERNBASE) / PGSIZE) 
+	{
+		//4
+		pages[i].pp_ref = 1;
+		pages[i].pp_link = NULL;
+	} else 
+	{
+		//2
+		pages[i].pp_ref = 0;
+		pages[i].pp_link = page_free_list;
+		page_free_list = &pages[i];
+	}
+}
+
+4) page_alloc : set up a page, with some case checking for null. wasnt sure how to use alloc_flags, but this is what came up
+if (page_free_list == NULL) 
+{
+	return NULL;
+}
+	
+struct PageInfo* page = page_free_list;
+page_free_list = page_free_list->pp_link;
+page->pp_link = NULL;
+if (alloc_flags & ALLOC_ZERO) 
+{
+	memset(page2kva(page), 0, PGSIZE);
+}
+return page;
+}
+
+5) page_free : panic according to the hunt, assign page_free_list and pp
+if (pp->pp_ref != 0) 
+{
+	panic("pp_ref non-NULL\n");
+}
+if (pp->pp_link != NULL) 
+{
+	panic("pp_link non-NULL\n");
+}
+	pp->pp_link = page_free_list;
+	page_free_list = pp;
+}
+
+6) pgdir_walk : had to collaborate significantly to translate prompt, came down to 4 cases
+uintptr_t* pt_addr = pgdir + PDX(va);
+	
+if (*pt_addr & PTE_P) 
+{
+	return (pte_t*)KADDR(PTE_ADDR(*pt_addr)) + PTX(va);
+} 
+if (create == false) 
+{
+	return NULL;
+} 
+	
+struct PageInfo* new_pg = page_alloc(ALLOC_ZERO);
+if (new_pg == NULL) 
+{
+	return NULL;
+}
+	
+new_pg->pp_ref++;
+	
+*pt_addr = page2pa(new_pg) | PTE_U | PTE_W | PTE_P;
+		
+return (pte_t *)KADDR(PTE_ADDR(*pt_addr)) + PTX(va);
+
+7) boot_map_region : map va + size as prompt describes and | perm and PTE_P bits in
+uintptr_t* p;
+	
+for (size_t i = 0; i < size; i += PGSIZE) 
+{
+	p = pgdir_walk(pgdir, (void*)(va + i), 1);
+		
+if (p == NULL) 
+{
+	panic("Mapping failed\n");
+} 
+		
+	*p = (pa + i) | perm | PTE_P;
+}
+
+8) page_insert : remove page given that conditions in the prompt, handle null, return 0 increment ref. allow insertion into pgdir, page_remove handles tlb_invalidation
+uintptr_t* p = pgdir_walk(pgdir, va, 1);
+	
+if (p == NULL) 
+{
+	return -E_NO_MEM;
+}
+	
+pp->pp_ref++;
+if ((*p & PTE_P) == 1) 
+{
+	page_remove(pgdir, va);
+}
+
+*p = page2pa(pp) | perm | PTE_P;
+*(pgdir + PDX(va)) |= perm;
+return 0;
+
+9) PageInfo : handle the 2 cases in the prompt, return the hinted solution
+uintptr_t* p = pgdir_walk(pgdir, va, 0);
+	
+if (p == NULL || (*p & PTE_P) == 0) 
+{
+	return NULL;
+} 
+if (pte_store != 0) 
+{
+	*pte_store = p;
+}
+		
+return pa2page(PTE_ADDR(*p));
+
+10) page_remove : use decref, set 0 and tlb invalidate
+uintptr_t* p;
+	
+struct PageInfo *pg = page_lookup(pgdir, va, &p);
+if (pg == NULL) 
+{
+	return ;
+} 
+page_decref(pg);
+*p = 0;
+tlb_invalidate(pgdir, va);
+
